@@ -108,6 +108,7 @@ struct android_dev {
 	bool connected;
 	bool sw_connected;
 	struct work_struct work;
+	struct work_struct mirrorlink_work;
 };
 
 static struct class *android_class;
@@ -754,6 +755,40 @@ static struct android_usb_function dm_function = {
 	.bind_config    = dm_function_bind_config,
 };
 
+/* MirrorLink NCM control request handling */
+
+static void mirrorlink_work(struct work_struct *data)
+{
+    struct android_dev *dev = container_of(data, struct android_dev, work);
+    char *envp[2] = { "NCM=START", NULL };
+    kobject_uevent_env(&dev->dev->kobj, KOBJ_CHANGE, envp);
+}
+
+static int mirrorlink_ctrlrequest(struct usb_composite_dev *cdev,
+                const struct usb_ctrlrequest *ctrl)
+{
+    int value = -EOPNOTSUPP;
+    u8 b_requestType = ctrl->bRequestType;
+    u8 b_request = ctrl->bRequest; 
+        
+/*          
+    printk(KERN_INFO "acc_ctrlrequest "
+            "%02x.%02x v%04x i%04x l%u\n",
+            b_requestType, b_request,
+            w_value, w_index, w_length);
+*/  
+        
+    if (b_requestType == (USB_DIR_OUT | USB_TYPE_VENDOR)) {
+        if (b_request == 0xF0) {
+            schedule_work(&_android_dev->mirrorlink_work);
+            value = 0;
+        }
+    }
+    return value;
+}
+
+/* End of MirrorLink NCM control request handling */
+
 static struct android_usb_function *supported_functions[] = {
 	&adb_function,
 	&acm_function,
@@ -1179,6 +1214,11 @@ android_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c)
 	if (value < 0)
 		value = acc_ctrlrequest(cdev, c);
 
+    /* Also handle the control request to enable CDC NCM mode
+     * for MirrorLink. */
+	if (value < 0)
+		value = mirrorlink_ctrlrequest(cdev, c);
+
 	if (value < 0)
 		value = composite_setup(gadget, c);
 
@@ -1249,6 +1289,7 @@ static int __init init(void)
 	dev->functions = supported_functions;
 	INIT_LIST_HEAD(&dev->enabled_functions);
 	INIT_WORK(&dev->work, android_work);
+	INIT_WORK(&dev->mirrorlink_work, mirrorlink_work);
 
 	err = android_create_device(dev);
 	if (err) {
