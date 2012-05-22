@@ -968,7 +968,32 @@ static ssize_t enable_store(struct device *pdev, struct device_attribute *attr,
 
 	sscanf(buff, "%d", &enabled);
 	if (enabled && !dev->enabled) {
-		cdev->next_string_id = 0;
+        /* Previously at this point the Android driver did
+         *   cdev->next_string_id = 0;
+         * This served to reset the ID of strings used within
+         * the descriptor. This was beneficial because otherwise
+         * repeated enabling/disabling of functions (e.g.
+         * tethering) would cause us to run out of valid string
+         * IDs.
+         * However, simple reset to 0 caused problems because
+         * some of the string IDs were already allocated in
+         * android_bind. Hence, the newly allocated strings
+         * (starting from 0) conflicted with the strings
+         * previously allocated (again, starting from 0).
+         * So, for the moment, we just have to continue
+         * to count upwards in string IDs. This means we have
+         * a finite number of 'enable'/'disable' operations
+         * possible before we reach the 254 maximum number of
+         * strings. This means, for example, that tethering
+         * can only be turned on and off a finite number of times.
+         * An alternative fix might be to save the
+         * cdev->next_string_id at the end of android_bind,
+         * and then reset next_string_id to that within this code.
+         * However I'm insufficiently confident that this is the right
+         * move; it might be necessary to do more radical
+         * rearchitecting (e.g. keeping a bitmask of which strings
+         * are used within usb_string_id and ensuring that they
+         * are released appropriately for subsequent re-use.) */
 		/* update values in composite driver's copy of device descriptor */
 		cdev->desc.idVendor = device_desc.idVendor;
 		cdev->desc.idProduct = device_desc.idProduct;
