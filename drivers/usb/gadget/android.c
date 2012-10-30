@@ -170,17 +170,18 @@ static void android_work(struct work_struct *data)
 	char *disconnected[2] = { "USB_STATE=DISCONNECTED", NULL };
 	char *connected[2]    = { "USB_STATE=CONNECTED", NULL };
 	char *configured[2]   = { "USB_STATE=CONFIGURED", NULL };
-	char *ncm[2]   = { "USB_STATE=NCM", NULL };
+	char *ncm[2]          = { "USB_STATE=NCM", NULL };
 	char **uevent_envp = NULL;
 	unsigned long flags;
 
 	spin_lock_irqsave(&cdev->lock, flags);
-    if (dev->mirrorlink && !dev->sw_mirrorlink)
+	if (dev->mirrorlink && !dev->sw_mirrorlink)
 		uevent_envp = ncm;
-    else if (cdev->config)
+	else if (cdev->config)
 		uevent_envp = configured;
 	else if (dev->connected != dev->sw_connected)
 		uevent_envp = dev->connected ? connected : disconnected;
+
 	dev->sw_mirrorlink = dev->mirrorlink;
 	dev->sw_connected = dev->connected;
 	spin_unlock_irqrestore(&cdev->lock, flags);
@@ -769,8 +770,8 @@ static int mirrorlink_ctrlrequest(struct usb_composite_dev *cdev,
     int value = -EOPNOTSUPP;
     u8 b_requestType = ctrl->bRequestType;
     u8 b_request = ctrl->bRequest; 
+	u16	w_length = le16_to_cpu(ctrl->wLength);
 	unsigned long flags;
-        
     if (b_requestType == (USB_DIR_OUT | USB_TYPE_VENDOR)) {
         if (b_request == 0xF0) {
             printk(KERN_INFO "ml_ctrlrequest: found request");
@@ -781,6 +782,15 @@ static int mirrorlink_ctrlrequest(struct usb_composite_dev *cdev,
             value = 0;
         }
     }
+	/* respond with data transfer or status phase? */
+	if (value >= 0) {
+		int rc;
+		cdev->req->zero = value < w_length;
+		cdev->req->length = value;
+		rc = usb_ep_queue(cdev->gadget->ep0, cdev->req, GFP_ATOMIC);
+		if (rc < 0)
+            printk(KERN_INFO "ml_ctrlrequest: setup response queue error");
+	}
     return value;
 }
 
@@ -1030,10 +1040,12 @@ static ssize_t state_show(struct device *pdev, struct device_attribute *attr,
 		goto out;
 
 	spin_lock_irqsave(&cdev->lock, flags);
-        if (cdev->config)
+	if (cdev->config)
 		state = "CONFIGURED";
 	else if (dev->connected)
 		state = "CONNECTED";
+	else if (dev->mirrorlink)
+		state = "NCM";
 	spin_unlock_irqrestore(&cdev->lock, flags);
 out:
 	return sprintf(buf, "%s\n", state);
@@ -1268,6 +1280,7 @@ static void android_disconnect(struct usb_gadget *gadget)
 	spin_lock_irqsave(&cdev->lock, flags);
 	dev->connected = 0;
 	dev->mirrorlink = 0;
+	dev->sw_mirrorlink = 0;
 	schedule_work(&dev->work);
 	spin_unlock_irqrestore(&cdev->lock, flags);
 }
