@@ -54,6 +54,7 @@
 #include "f_accessory.c"
 #define USB_ETH_RNDIS y
 #include "f_rndis.c"
+#include "f_ncm.c"
 #include "rndis.c"
 #include "u_ether.c"
 #include "f_dm.c"
@@ -113,7 +114,9 @@ struct android_dev {
 	int disable_depth;
 	struct mutex mutex;
 	bool connected;
+	bool mirrorlink;
 	bool sw_connected;
+	bool sw_mirrorlink;
 	struct work_struct work;
 };
 
@@ -173,14 +176,19 @@ static void android_work(struct work_struct *data)
 	char *disconnected[2] = { "USB_STATE=DISCONNECTED", NULL };
 	char *connected[2]    = { "USB_STATE=CONNECTED", NULL };
 	char *configured[2]   = { "USB_STATE=CONFIGURED", NULL };
+	char *ncm[2]          = { "USB_STATE=NCM", NULL };
 	char **uevent_envp = NULL;
 	unsigned long flags;
 
 	spin_lock_irqsave(&cdev->lock, flags);
-        if (cdev->config)
+	if (dev->mirrorlink && !dev->sw_mirrorlink)
+		uevent_envp = ncm;
+	else if (cdev->config)
 		uevent_envp = configured;
 	else if (dev->connected != dev->sw_connected)
 		uevent_envp = dev->connected ? connected : disconnected;
+
+	dev->sw_mirrorlink = dev->mirrorlink;
 	dev->sw_connected = dev->connected;
 	spin_unlock_irqrestore(&cdev->lock, flags);
 
@@ -622,6 +630,101 @@ static struct android_usb_function rndis_function = {
 	.attributes	= rndis_function_attributes,
 };
 
+/******* Start of additions for NCM support ****/
+
+struct ncm_function_config {
+    u8      ethaddr[ETH_ALEN];
+};
+
+static int ncm_function_bind_config(struct android_usb_function *f,
+                    struct usb_configuration *c)
+{
+    int ret;
+    struct ncm_function_config *ncm = f->config;
+
+    if (!ncm) {
+        pr_err("%s: ncm_pdata\n", __func__);
+        return -1;
+    }
+
+    pr_info("%s MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", __func__,
+            ncm->ethaddr[0], ncm->ethaddr[1], ncm->ethaddr[2],
+            ncm->ethaddr[3], ncm->ethaddr[4], ncm->ethaddr[5]);
+
+    ret = gether_setup_name(c->cdev->gadget, ncm->ethaddr, "ncm");
+    if (ret) {
+        pr_err("%s: gether_setup failed\n", __func__);
+        return ret;
+    }
+
+    printk("About to ncm_bind_config");
+    ret = ncm_bind_config(c, ncm->ethaddr);
+    printk("ret from ncm_bind_config was %d", ret);
+    return ret;
+}
+
+static void ncm_function_unbind_config(struct android_usb_function *f,
+                        struct usb_configuration *c)
+{
+    gether_cleanup();
+}
+
+static ssize_t ncm_ethaddr_show(struct device *dev,
+        struct device_attribute *attr, char *buf)
+{
+    struct android_usb_function *f = dev_get_drvdata(dev);
+    struct ncm_function_config *ncm = f->config;
+    return sprintf(buf, "%02x:%02x:%02x:%02x:%02x:%02x\n",
+            ncm->ethaddr[0], ncm->ethaddr[1], ncm->ethaddr[2],
+            ncm->ethaddr[3], ncm->ethaddr[4], ncm->ethaddr[5]);
+}
+
+static ssize_t ncm_ethaddr_store(struct device *dev,
+        struct device_attribute *attr, const char *buf, size_t size)
+{
+    struct android_usb_function *f = dev_get_drvdata(dev);
+    struct ncm_function_config *ncm = f->config;
+
+    if (sscanf(buf, "%02x:%02x:%02x:%02x:%02x:%02x\n",
+            (int *)&ncm->ethaddr[0], (int *)&ncm->ethaddr[1],
+            (int *)&ncm->ethaddr[2], (int *)&ncm->ethaddr[3],
+            (int *)&ncm->ethaddr[4], (int *)&ncm->ethaddr[5]) == 6)
+        return size;
+    return -EINVAL;
+}
+
+static DEVICE_ATTR(ethaddr_ncm, S_IRUGO | S_IWUSR, ncm_ethaddr_show,
+                           ncm_ethaddr_store);
+
+static int ncm_function_init(struct android_usb_function *f, struct usb_composite_dev *cdev)
+{
+    f->config = kzalloc(sizeof(struct ncm_function_config), GFP_KERNEL);
+    if (!f->config)
+        return -ENOMEM;
+    return 0;
+}
+
+static void ncm_function_cleanup(struct android_usb_function *f)
+{
+    kfree(f->config);
+    f->config = NULL;
+}
+
+static struct device_attribute *ncm_function_attributes[] = {
+	&dev_attr_ethaddr_ncm,
+	NULL
+};
+
+static struct android_usb_function ncm_function = {
+	.name		= "ncm",
+	.init		= ncm_function_init,
+	.cleanup	= ncm_function_cleanup,
+	.bind_config	= ncm_function_bind_config,
+	.unbind_config	= ncm_function_unbind_config,
+	.attributes	= ncm_function_attributes,
+};
+
+/***** End of additions for NCM support *****/
 
 struct mass_storage_function_config {
 	struct fsg_config fsg;
@@ -818,12 +921,48 @@ static struct android_usb_function dm_function = {
 	.bind_config    = dm_function_bind_config,
 };
 
+/* MirrorLink NCM control request handling */
+
+static int mirrorlink_ctrlrequest(struct usb_composite_dev *cdev,
+                const struct usb_ctrlrequest *ctrl)
+{
+    struct android_dev      *dev = _android_dev;
+    int value = -EOPNOTSUPP;
+    u8 b_requestType = ctrl->bRequestType;
+    u8 b_request = ctrl->bRequest;
+	u16	w_length = le16_to_cpu(ctrl->wLength);
+	unsigned long flags;
+    if (b_requestType == (USB_DIR_OUT | USB_TYPE_VENDOR)) {
+        if (b_request == 0xF0) {
+            printk(KERN_INFO "ml_ctrlrequest: found request");
+	        spin_lock_irqsave(&cdev->lock, flags);
+	        dev->mirrorlink = 1;
+	        schedule_work(&dev->work);
+	        spin_unlock_irqrestore(&cdev->lock, flags);
+            value = 0;
+        }
+    }
+	/* respond with data transfer or status phase? */
+	if (value >= 0) {
+		int rc;
+		cdev->req->zero = value < w_length;
+		cdev->req->length = value;
+		rc = usb_ep_queue(cdev->gadget->ep0, cdev->req, GFP_ATOMIC);
+		if (rc < 0)
+            printk(KERN_INFO "ml_ctrlrequest: setup response queue error");
+	}
+    return value;
+}
+
+/* End of MirrorLink NCM control request handling */
+
 static struct android_usb_function *supported_functions[] = {
 	&adb_function,
 	&acm_function,
 	&mtp_function,
 	&ptp_function,
 	&rndis_function,
+	&ncm_function,
 	&mass_storage_function,
 	&accessory_function,
 	&audio_source_function,
@@ -1058,10 +1197,12 @@ static ssize_t state_show(struct device *pdev, struct device_attribute *attr,
 		goto out;
 
 	spin_lock_irqsave(&cdev->lock, flags);
-        if (cdev->config)
+	if (cdev->config)
 		state = "CONFIGURED";
 	else if (dev->connected)
 		state = "CONNECTED";
+	else if (dev->mirrorlink)
+		state = "NCM";
 	spin_unlock_irqrestore(&cdev->lock, flags);
 out:
 	return sprintf(buf, "%s\n", state);
@@ -1260,6 +1401,11 @@ android_setup(struct usb_gadget *gadget, const struct usb_ctrlrequest *c)
 	if (value < 0)
 		value = acc_ctrlrequest(cdev, c);
 
+    /* Also handle the control request to enable CDC NCM mode
+     * for MirrorLink. */
+	if (value < 0)
+		value = mirrorlink_ctrlrequest(cdev, c);
+
 	if (value < 0)
 		value = composite_setup(gadget, c);
 
@@ -1291,6 +1437,8 @@ static void android_disconnect(struct usb_gadget *gadget)
 
 	spin_lock_irqsave(&cdev->lock, flags);
 	dev->connected = 0;
+	dev->mirrorlink = 0;
+	dev->sw_mirrorlink = 0;
 	schedule_work(&dev->work);
 	spin_unlock_irqrestore(&cdev->lock, flags);
 }
